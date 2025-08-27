@@ -18,51 +18,93 @@ app = Flask(__name__)
 def home():
     return "ok"
 
+# Словарь для хранения данных пользователей в сессии
+user_sessions = {}
+
+MAX_MEDIA = 4  # максимальное количество медиа
+
 # --- /start ---
 @bot.message_handler(commands=['start'])
 def start(message):
-    welcome_text = (
-        "<b>👋 Привет! Ты в предложке канала UnderNet.</b>\n\n"
-        "Здесь ты можешь:\n"
-        "— Предложить идею для поста\n"
-        "— Попросить разобрать сайт\n"
-        "— Поделиться находкой из интернета\n\n"
-        "✍️ Просто напиши сообщение сюда, и оно попадёт админу.\n\n"
-        "⚡️ Все твои идеи важны — спасибо, что участвуешь в проекте!\n\n"
-        "✍️ Сначала напиши своё сообщение или идею."
-    )
-    bot.reply_to(message, welcome_text, parse_mode='html')
+    chat_id = message.chat.id
+    user_sessions[chat_id] = {'text': None, 'media': [], 'count': 0}
+    bot.reply_to(message, "👋 Привет! Сначала напиши текст своего сообщения или идеи.")
     bot.register_next_step_handler(message, handle_text_step)
 
 # --- Этап 1: текстовое сообщение ---
 def handle_text_step(message):
-    user_text = message.text
-    bot.send_message(message.chat.id, "Спасибо за сообщение! Теперь можешь прислать фото/видео. Если не хочешь — напиши 'нет'.")
-    bot.register_next_step_handler(message, handle_media_step, user_text)
+    chat_id = message.chat.id
+    user_sessions[chat_id]['text'] = message.text
+    bot.send_message(chat_id, "Текст получен! Хочешь отправить фото/видео? Если нет — напиши 'нет'.")
+    bot.register_next_step_handler(message, handle_media_prompt)
 
-# --- Этап 2: фото/видео ---
-def handle_media_step(message, user_text):
-    # Отправляем текст админу
-    bot.send_message(ADMIN_CHAT_ID,
-                     f"💡 Новое сообщение от @{message.from_user.username or message.from_user.id}:\n\n{user_text}")
+# --- Этап 2: спрашиваем, хочет ли пользователь прислать медиа ---
+def handle_media_prompt(message):
+    chat_id = message.chat.id
+    if message.text.lower() == 'нет':
+        # отправляем админу текст и завершаем
+        bot.send_message(chat_id, "Окей, спасибо! Уже бегу к админу с твоим сообщением!")
+        send_to_admin(chat_id)
+        user_sessions.pop(chat_id)
+    else:
+        bot.send_message(chat_id, f"Отправляй фото/видео (0/{MAX_MEDIA})")
+        bot.register_next_step_handler(message, handle_media_step)
+
+# --- Этап 3: приём медиа ---
+def handle_media_step(message):
+    chat_id = message.chat.id
+    session = user_sessions.get(chat_id)
+    if session is None:
+        bot.send_message(chat_id, "Сессия не найдена. Начни с /start")
+        return
+
+    if len(session['media']) >= MAX_MEDIA:
+        bot.send_message(chat_id, f"Нельзя отправлять больше {MAX_MEDIA} медиа!")
+        bot.send_message(chat_id, "Если хочешь, заверши отправку, напиши 'да'.")
+        bot.register_next_step_handler(message, handle_media_confirm)
+        return
 
     if message.content_type == 'photo':
         file_id = message.photo[-1].file_id
-        bot.send_photo(ADMIN_CHAT_ID, file_id,
-                       caption=f"📷 От @{message.from_user.username or message.from_user.id}")
+        session['media'].append({'type': 'photo', 'file_id': file_id})
     elif message.content_type == 'video':
         file_id = message.video.file_id
-        bot.send_video(ADMIN_CHAT_ID, file_id,
-                       caption=f"🎥 От @{message.from_user.username or message.from_user.id}")
-    elif message.text.lower() == 'нет':
-        bot.send_message(message.chat.id, "Хорошо, нет так нет!")
+        session['media'].append({'type': 'video', 'file_id': file_id})
+    elif message.text.lower() == 'да':
+        bot.send_message(chat_id, "Спасибо! Уже бегу к админу с твоим сообщением!")
+        send_to_admin(chat_id)
+        user_sessions.pop(chat_id)
         return
     else:
-        bot.send_message(message.chat.id, "Неправильный формат. Присылай фото/видео или напиши 'нет'.")
-        bot.register_next_step_handler(message, handle_media_step, user_text)
+        bot.send_message(chat_id, "Неправильный формат. Присылай фото/видео или напиши 'да', если закончил.")
+        bot.register_next_step_handler(message, handle_media_step)
         return
 
-    bot.send_message(message.chat.id, "Спасибо! Все данные отправлены автору ✅")
+    count = len(session['media'])
+    if count >= MAX_MEDIA:
+        bot.send_message(chat_id, f"{count}/{MAX_MEDIA} — достигнут лимит!")
+        bot.send_message(chat_id, "Спасибо! Уже бегу к админу с твоим сообщением!")
+        send_to_admin(chat_id)
+        user_sessions.pop(chat_id)
+    else:
+        bot.send_message(chat_id, f"{count}/{MAX_MEDIA}, это все? Если да — напиши 'да', если нет — присылай дальше.")
+        bot.register_next_step_handler(message, handle_media_step)
+
+# --- Функция отправки админу ---
+def send_to_admin(chat_id):
+    session = user_sessions.get(chat_id)
+    if session is None:
+        return
+    text = session['text'] or "(нет текста)"
+    bot.send_message(ADMIN_CHAT_ID,
+                     f"💡 Новое сообщение от @{bot.get_chat(chat_id).username or chat_id}:\n\n{text}")
+    for m in session['media']:
+        if m['type'] == 'photo':
+            bot.send_photo(ADMIN_CHAT_ID, m['file_id'],
+                           caption=f"📷 От @{bot.get_chat(chat_id).username or chat_id}")
+        elif m['type'] == 'video':
+            bot.send_video(ADMIN_CHAT_ID, m['file_id'],
+                           caption=f"🎥 От @{bot.get_chat(chat_id).username or chat_id}")
 
 # --- Запуск Flask и бота ---
 def run_flask():
