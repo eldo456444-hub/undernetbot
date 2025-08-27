@@ -1,9 +1,10 @@
-# app.py
-import os, threading, time
+import os
+import threading
+import time
 from flask import Flask
 import telebot
 
-# 🔑 токен берём из переменных окружения Render
+# 🔑 Токен берём из переменных окружения Render
 TOKEN = os.environ['TOKEN']
 bot = telebot.TeleBot(TOKEN)
 
@@ -25,26 +26,63 @@ def start(message):
     )
     bot.reply_to(message, welcome_text, parse_mode='html')
 
+# --- Универсальный ответ ---
+def send_acknowledgement(message):
+    bot.reply_to(message, "Спасибо за сообщение!")
+
 # --- Текстовые сообщения ---
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
-    user_message = message.text
-    bot.reply_to(message, "Спасибо! Я передал твою идею автору ✅")
+    send_acknowledgement(message)
     bot.send_message(
         ADMIN_CHAT_ID,
-        f"💡 Новая идея от @{message.from_user.username or message.from_user.id}:\n\n{user_message}"
+        f"💡 Новое сообщение от @{message.from_user.username or message.from_user.id}:\n\n{message.text}"
     )
 
-# --- Фото с подписью ---
+# --- Фото ---
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
+    send_acknowledgement(message)
     caption = message.caption or "(без подписи)"
-    bot.reply_to(message, "Спасибо за фото! Я передал его автору ✅")
     file_id = message.photo[-1].file_id
     bot.send_photo(
         ADMIN_CHAT_ID,
         file_id,
-        caption=f"📷 Новая идея от @{message.from_user.username or message.from_user.id}:\n\n{caption}"
+        caption=f"📷 Новое фото от @{message.from_user.username or message.from_user.id}:\n\n{caption}"
+    )
+
+# --- Видео ---
+@bot.message_handler(content_types=['video'])
+def handle_video(message):
+    send_acknowledgement(message)
+    caption = message.caption or "(без подписи)"
+    file_id = message.video.file_id
+    bot.send_video(
+        ADMIN_CHAT_ID,
+        file_id,
+        caption=f"🎥 Новое видео от @{message.from_user.username or message.from_user.id}:\n\n{caption}"
+    )
+
+# --- Аудио ---
+@bot.message_handler(content_types=['audio'])
+def handle_audio(message):
+    send_acknowledgement(message)
+    file_id = message.audio.file_id
+    bot.send_audio(
+        ADMIN_CHAT_ID,
+        file_id,
+        caption=f"🎵 Новое аудио от @{message.from_user.username or message.from_user.id}"
+    )
+
+# --- Документы ---
+@bot.message_handler(content_types=['document'])
+def handle_document(message):
+    send_acknowledgement(message)
+    file_id = message.document.file_id
+    bot.send_document(
+        ADMIN_CHAT_ID,
+        file_id,
+        caption=f"📎 Новый документ от @{message.from_user.username or message.from_user.id}"
     )
 
 # --- Flask для Render ---
