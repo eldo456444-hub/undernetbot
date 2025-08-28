@@ -1,25 +1,45 @@
-from telegram import Update, InputMediaPhoto, InputMediaVideo, ParseMode
-from telegram.ext import (
-    Updater,
-    CommandHandler,
-    MessageHandler,
-    Filters,
-    ConversationHandler,
-    CallbackContext,
-)
+import os
+import threading
+import time
+from flask import Flask
+import telebot
+from telebot.types import InputMediaPhoto, InputMediaVideo
 
-# --- состояния ---
-TEXT, MEDIA_DECISION, MEDIA = range(3)
+# токен берём из переменных окружения
+TOKEN = os.environ.get('TOKEN')
+bot = telebot.TeleBot(TOKEN)
 
-# --- хранилище данных ---
-user_data = {}
+# замените на свой ID
+ADMIN_CHAT_ID = -4881160812
 
-# --- старт ---
-def start(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    user_data[user_id] = {"text": None, "media": []}
+app = Flask(__name__)
 
-    update.message.reply_text(
+@app.route("/")
+def home():
+    return "ok"
+
+# сессии пользователей
+user_sessions = {}
+MAX_MEDIA = 4
+
+def reset_session(chat_id):
+    """Сброс сессии для пользователя."""
+    user_sessions[chat_id] = {'text': None, 'media': []}
+
+def is_again_command(message):
+    """Проверяем, хочет ли пользователь начать заново."""
+    if message is None or message.text is None:
+        return False
+    t = message.text.strip().lower()
+    return t == '/again' or t == 'again' or t == '/start'
+
+# --- старт и /again как команда (для надёжности) ---
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
+    chat_id = message.chat.id
+    reset_session(chat_id)
+    bot.reply_to(
+        message,
         "<b>👋 Привет! Ты в предложке канала UnderNet.</b>\n\n"
         "Здесь ты можешь:\n"
         "— Предложить идею для поста\n"
@@ -28,119 +48,163 @@ def start(update: Update, context: CallbackContext):
         "✍️ Просто напиши сообщение сюда, и оно попадёт админу.\n\n"
         "⚡️ Все твои идеи важны — спасибо, что участвуешь в проекте!\n\n"
         "💡Сначала напиши текст своего сообщения или идеи.",
-        parse_mode=ParseMode.HTML
+        parse_mode='HTML'
     )
-    return TEXT
+    bot.register_next_step_handler(message, handle_text_step)
 
-# --- обработка текста ---
-def handle_text(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    user_data[user_id]["text"] = update.message.text
-
-    update.message.reply_text(
-        "Хочешь добавить фото/видео?\nНапиши 'да' или 'нет'."
+@bot.message_handler(commands=['again'])
+def cmd_again(message):
+    # Команда /again работает в любом состоянии
+    chat_id = message.chat.id
+    reset_session(chat_id)
+    bot.reply_to(
+        message,
+        "<b>🔄 Начнём заново!</b>\n\nПожалуйста, напиши текст своего сообщения или идеи.",
+        parse_mode='HTML'
     )
-    return MEDIA_DECISION
+    bot.register_next_step_handler(message, handle_text_step)
 
-# --- выбор медиа ---
-def handle_media_decision(update: Update, context: CallbackContext):
-    text = update.message.text.lower()
-    if text == "да":
-        update.message.reply_text("Отправляй фото или видео (максимум 4).\n0/4")
-        return MEDIA
-    elif text == "нет":
-        send_to_admin(update, context)
-        return ConversationHandler.END
+# --- Шаг 1: текст ---
+def handle_text_step(message):
+    chat_id = message.chat.id
+
+    # если пользователь ввёл /again или /start в этот момент — перезапускаем
+    if is_again_command(message):
+        reset_session(chat_id)
+        bot.reply_to(message, "<b>🔄 Начнём заново!</b>\n\nПожалуйста, напиши текст.", parse_mode='HTML')
+        bot.register_next_step_handler(message, handle_text_step)
+        return
+
+    # сохраняем текст
+    user_sessions.setdefault(chat_id, {'text': None, 'media': []})
+    user_sessions[chat_id]['text'] = message.text
+    bot.send_message(chat_id, "✅ Текст получен!\n📷 Хочешь отправить фото/видео? Напиши 'да' или 'нет'.")
+    bot.register_next_step_handler(message, handle_media_prompt)
+
+# --- Шаг 2: спрашиваем про медиа ---
+def handle_media_prompt(message):
+    chat_id = message.chat.id
+
+    # если команда /again — сразу начинаем заново
+    if is_again_command(message):
+        reset_session(chat_id)
+        bot.reply_to(message, "<b>🔄 Начнём заново!</b>\n\nПожалуйста, напиши текст.", parse_mode='HTML')
+        bot.register_next_step_handler(message, handle_text_step)
+        return
+
+    text = (message.text or "").strip().lower()
+    if text == 'нет':
+        bot.send_message(chat_id, "✅ Окей! Уже бегу к админу с твоим сообщением!")
+        send_to_admin(chat_id)
+        user_sessions.pop(chat_id, None)
+    elif text == 'да':
+        bot.send_message(chat_id, f"Отправляй фото/видео (0/{MAX_MEDIA})")
+        bot.register_next_step_handler(message, handle_media_step)
     else:
-        update.message.reply_text("Не понял? Напиши ещё раз: 'да' или 'нет'.")
-        return MEDIA_DECISION
+        bot.send_message(chat_id, "⛔ Не понял? Напиши 'да' или 'нет'.")
+        bot.register_next_step_handler(message, handle_media_prompt)
 
-# --- загрузка медиа ---
-def handle_media(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    media_list = user_data[user_id]["media"]
+# --- Шаг 3: приём медиа ---
+def handle_media_step(message):
+    chat_id = message.chat.id
 
-    if len(media_list) >= 4:
-        update.message.reply_text("❌ Нельзя отправлять больше 4 фото/видео!")
-        return MEDIA
+    # если команда /again — перезапускаем
+    if is_again_command(message):
+        reset_session(chat_id)
+        bot.reply_to(message, "<b>🔄 Начнём заново!</b>\n\nПожалуйста, напиши текст.", parse_mode='HTML')
+        bot.register_next_step_handler(message, handle_text_step)
+        return
 
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
-        media_list.append(("photo", file_id))
-    elif update.message.video:
-        file_id = update.message.video.file_id
-        media_list.append(("video", file_id))
+    session = user_sessions.get(chat_id)
+    if session is None:
+        bot.send_message(chat_id, "⛔ Сессия не найдена. Начни с /start")
+        return
 
-    count = len(media_list)
-    update.message.reply_text(
-        f"{count}/4. Это всё? Напиши 'да' или продолжай отправлять."
-    )
-    return MEDIA_DECISION
+    # проверка лимита
+    if len(session['media']) >= MAX_MEDIA:
+        bot.send_message(chat_id, f"⛔ Нельзя отправлять больше {MAX_MEDIA} медиа!")
+        bot.send_message(chat_id, "👌 Если хочешь, заверши отправку, напиши 'да'.")
+        bot.register_next_step_handler(message, handle_media_confirm)
+        return
 
-# --- неправильный ввод на этапе выбора медиа ---
-def wrong_input_media_decision(update: Update, context: CallbackContext):
-    update.message.reply_text("Не понял? Напиши 'да' или 'нет'.")
-    return MEDIA_DECISION
+    # принимаем медиа
+    if message.content_type == 'photo':
+        file_id = message.photo[-1].file_id
+        session['media'].append({'type': 'photo', 'file_id': file_id})
+    elif message.content_type == 'video':
+        file_id = message.video.file_id
+        session['media'].append({'type': 'video', 'file_id': file_id})
+    elif (message.text or "").strip().lower() == 'да':
+        bot.send_message(chat_id, "❤ Спасибо! Уже бегу к админу с твоим сообщением!")
+        send_to_admin(chat_id)
+        user_sessions.pop(chat_id, None)
+        return
+    else:
+        bot.send_message(chat_id, "⛔ Неправильный формат. Присылай фото/видео или напиши 'да', если закончил.")
+        bot.register_next_step_handler(message, handle_media_step)
+        return
 
-# --- неправильный ввод на этапе загрузки ---
-def wrong_input_media(update: Update, context: CallbackContext):
-    update.message.reply_text("⛔ Неправильный формат. Присылай фото/видео или напиши 'да', если закончил.")
-    return MEDIA
+    count = len(session['media'])
+    if count >= MAX_MEDIA:
+        bot.send_message(chat_id, f"{count}/{MAX_MEDIA} — достигнут лимит!")
+        bot.send_message(chat_id, "❤ Спасибо! Уже бегу к админу с твоим сообщением!")
+        send_to_admin(chat_id)
+        user_sessions.pop(chat_id, None)
+    else:
+        bot.send_message(chat_id, f"{count}/{MAX_MEDIA}, 👌 это всё? Если да — напиши 'да', если нет — присылай дальше.")
+        bot.register_next_step_handler(message, handle_media_step)
 
-# --- сброс /again ---
-def again(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    user_data[user_id] = {"text": None, "media": []}
-    update.message.reply_text("🔄 Начинаем заново!\n\n💡 Напиши новый текст для отправки.")
-    return TEXT
+def handle_media_confirm(message):
+    chat_id = message.chat.id
+    if is_again_command(message):
+        reset_session(chat_id)
+        bot.reply_to(message, "<b>🔄 Начнём заново!</b>\n\nПожалуйста, напиши текст.", parse_mode='HTML')
+        bot.register_next_step_handler(message, handle_text_step)
+        return
 
-# --- отправка админу ---
-def send_to_admin(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    text = user_data[user_id]["text"]
-    media = user_data[user_id]["media"]
+    if (message.text or "").strip().lower() == 'да':
+        bot.send_message(chat_id, "❤ Спасибо! Уже бегу к админу с твоим сообщением!")
+        send_to_admin(chat_id)
+        user_sessions.pop(chat_id, None)
+    else:
+        bot.send_message(chat_id, "Присылай дальше фото/видео.")
+        bot.register_next_step_handler(message, handle_media_step)
 
-    admin_id = YOUR_ADMIN_ID   # 🔴 замени на свой ID
+# --- отправка админу (текст отдельно, затем медиагруппа) ---
+def send_to_admin(chat_id):
+    session = user_sessions.get(chat_id)
+    if not session:
+        return
 
-    if media:
+    username = bot.get_chat(chat_id).username or chat_id
+    text = session['text'] or "(нет текста)"
+    bot.send_message(ADMIN_CHAT_ID, f"💡 Новое сообщение от @{username}:\n\n{text}")
+
+    if session['media']:
         media_group = []
-        for i, (mtype, file_id) in enumerate(media):
-            caption = text if i == 0 else None
-            if mtype == "photo":
-                media_group.append(InputMediaPhoto(file_id, caption=caption, parse_mode=ParseMode.HTML))
-            elif mtype == "video":
-                media_group.append(InputMediaVideo(file_id, caption=caption, parse_mode=ParseMode.HTML))
-        context.bot.send_media_group(chat_id=admin_id, media=media_group)
-    else:
-        context.bot.send_message(chat_id=admin_id, text=text, parse_mode=ParseMode.HTML)
+        for m in session['media']:
+            if m['type'] == 'photo':
+                media_group.append(InputMediaPhoto(m['file_id']))
+            elif m['type'] == 'video':
+                media_group.append(InputMediaVideo(m['file_id']))
+        # отправляем медиагруппу (до 10 элементов, у нас MAX_MEDIA=4)
+        bot.send_media_group(ADMIN_CHAT_ID, media_group)
 
-    update.message.reply_text("✅ Спасибо! Уже бегу к админу с твоим сообщением!")
+# --- запуск ---
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
-# --- main ---
-def main():
-    updater = Updater("YOUR_TOKEN", use_context=True)  # 🔴 замени на токен
-    dp = updater.dispatcher
-
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            TEXT: [MessageHandler(Filters.text & ~Filters.command, handle_text)],
-            MEDIA_DECISION: [
-                MessageHandler(Filters.regex("^(да|нет)$"), handle_media_decision),
-                MessageHandler(Filters.text & ~Filters.command, wrong_input_media_decision),
-            ],
-            MEDIA: [
-                MessageHandler(Filters.photo | Filters.video, handle_media),
-                MessageHandler(Filters.text & ~Filters.command, wrong_input_media),
-            ],
-        },
-        fallbacks=[CommandHandler("again", again)],
-    )
-
-    dp.add_handler(conv_handler)
-
-    updater.start_polling()
-    updater.idle()
+def run_bot():
+    while True:
+        try:
+            print("Бот запущен...")
+            bot.infinity_polling(skip_pending=True, timeout=10, long_polling_timeout=20)
+        except Exception as e:
+            print("Bot error:", e)
+            time.sleep(3)
 
 if __name__ == "__main__":
-    main()
+    # убедись, что TOKEN и ADMIN_CHAT_ID корректны
+    threading.Thread(target=run_flask, daemon=True).start()
+    run_bot()
