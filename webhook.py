@@ -1,13 +1,14 @@
-import os
 from flask import Flask, request
 import telebot
+import os
 
-TOKEN = os.environ.get('TOKEN')
+TOKEN = os.environ.get("TOKEN")
 bot = telebot.TeleBot(TOKEN)
-ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID', -4881160812))
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", -4881160812))
 
 app = Flask(__name__)
 
+# Маршрут webhook — обязательно слэш перед токеном
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
     json_str = request.get_data().decode("UTF-8")
@@ -15,10 +16,12 @@ def webhook():
     bot.process_new_updates([update])
     return "!", 200
 
+# Просто проверить, что сервер работает
 @app.route("/")
 def home():
     return "ok"
 
+# Устанавливаем webhook
 bot.remove_webhook()
 bot.set_webhook(url=f"https://undernetbot-2.onrender.com/{TOKEN}")
 
